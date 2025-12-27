@@ -24,7 +24,6 @@ except Exception:
 
 
 def iter_images_stream(root: Path):
-    """Generator: yields image paths without materializing full list."""
     for p in root.rglob("*"):
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
             yield p
@@ -41,6 +40,7 @@ def get_year_month(path: Path) -> tuple[str, str]:
                         dt_str = exif.get(TAG_DTO)
                     elif TAG_DT and TAG_DT in exif:
                         dt_str = exif.get(TAG_DT)
+
                     if isinstance(dt_str, str) and len(dt_str) >= 19:
                         try:
                             dt = datetime.strptime(dt_str[:19], "%Y:%m:%d %H:%M:%S")
@@ -49,6 +49,7 @@ def get_year_month(path: Path) -> tuple[str, str]:
                             pass
         except Exception:
             pass
+
     dt = datetime.fromtimestamp(path.stat().st_mtime)
     return f"{dt.year:04d}", f"{dt.month:02d}"
 
@@ -83,72 +84,120 @@ def format_bytes(n: int) -> str:
     return f"{v:.2f}PB"
 
 
-def _blake2b_small(data: bytes) -> str:
-    h = hashlib.blake2b(digest_size=20)
-    h.update(data)
-    return h.hexdigest()
+# --------------------
+# Logging: console-only vs report
+# --------------------
+def log_console(msg: str):
+    print(msg, flush=True)
 
-
-def quick_hash(path_str: str, head_tail_kb: int = 64) -> tuple[str, str]:
-    p = Path(path_str)
-    k = head_tail_kb * 1024
-    size = p.stat().st_size
-    with p.open("rb") as f:
-        head = f.read(k)
-        if size > k:
-            f.seek(max(0, size - k))
-            tail = f.read(k)
-        else:
-            tail = b""
-    return (path_str, _blake2b_small(head + tail))
-
-
-def full_hash(path_str: str, chunk_mb: int = 2) -> tuple[str, str]:
-    p = Path(path_str)
-    h = hashlib.blake2b(digest_size=32)
-    chunk = chunk_mb * 1024 * 1024
-    with p.open("rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.update(b)
-    return (path_str, h.hexdigest())
-
-
-def choose_keep(paths: list[Path]) -> Path:
-    def key(p: Path):
-        return (len(p.name), str(p).lower())
-    return min(paths, key=key)
-
-
-def list_files_in_dir(dir_path: Path) -> list[Path]:
-    if not dir_path.exists():
-        return []
-    return [p for p in dir_path.iterdir() if p.is_file()]
-
-
-def log(fp, msg: str, also_print: bool = True):
+def log_report(fp, msg: str):
     fp.write(msg + "\n")
     fp.flush()
-    if also_print:
-        print(msg, flush=True)
+
+def log_both(fp, msg: str):
+    log_report(fp, msg)
+    log_console(msg)
 
 
+# --------------------
+# Heartbeat file (Explorer에서도 "돌고 있음" 확인)
+# --------------------
 def heartbeat(path: Path):
-    # update timestamp in a file so user can see activity in Explorer
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"RUNNING {datetime.now().isoformat()}\n", encoding="utf-8")
 
 
 def fail_or_continue(fp, fail_fast: bool, msg: str, exc: Exception | None = None):
     if exc is not None:
-        log(fp, f"{msg} | EXC: {exc}")
+        log_both(fp, f"{msg} | EXC: {exc}")
     else:
-        log(fp, msg)
+        log_both(fp, msg)
     if fail_fast:
         raise RuntimeError(msg) from exc
 
+
+# --------------------
+# Hash helpers with timeout (best-effort on Windows)
+# --------------------
+class HashTimeout(Exception):
+    pass
+
+def _blake2b_small(data: bytes) -> str:
+    h = hashlib.blake2b(digest_size=20)
+    h.update(data)
+    return h.hexdigest()
+
+def _read_with_timeout(f, nbytes: int, timeout_sec: float, start_t: float, chunk: int = 4096) -> bytes:
+    """Read nbytes in small chunks, checking elapsed time."""
+    out = bytearray()
+    remain = nbytes
+    while remain > 0:
+        if time.monotonic() - start_t > timeout_sec:
+            raise HashTimeout("read timeout")
+        to_read = chunk if remain > chunk else remain
+        b = f.read(to_read)
+        if not b:
+            break
+        out.extend(b)
+        remain -= len(b)
+    return bytes(out)
+
+def quick_hash_timeout(path_str: str, head_tail_kb: int, timeout_sec: float) -> tuple[str, str] | tuple[str, None]:
+    """
+    Returns (path, quickhex) or (path, None) if skipped (timeout/err).
+    """
+    p = Path(path_str)
+    start_t = time.monotonic()
+    try:
+        k = head_tail_kb * 1024
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            head = _read_with_timeout(f, k, timeout_sec, start_t)
+            if size > k:
+                # seek는 보통 빠르지만, 그래도 timeout 체크는 유지
+                if time.monotonic() - start_t > timeout_sec:
+                    raise HashTimeout("timeout before tail seek")
+                f.seek(max(0, size - k))
+                tail = _read_with_timeout(f, k, timeout_sec, start_t)
+            else:
+                tail = b""
+        return (path_str, _blake2b_small(head + tail))
+    except HashTimeout:
+        return (path_str, None)
+    except Exception:
+        return (path_str, None)
+
+def full_hash_timeout(path_str: str, chunk_mb: int, timeout_sec: float) -> tuple[str, str] | tuple[str, None]:
+    """
+    Returns (path, fullhex) or (path, None) if skipped (timeout/err).
+    """
+    p = Path(path_str)
+    start_t = time.monotonic()
+    try:
+        h = hashlib.blake2b(digest_size=32)
+        chunk = chunk_mb * 1024 * 1024
+        with p.open("rb") as f:
+            while True:
+                if time.monotonic() - start_t > timeout_sec:
+                    raise HashTimeout("full-hash timeout")
+                b = f.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+        return (path_str, h.hexdigest())
+    except HashTimeout:
+        return (path_str, None)
+    except Exception:
+        return (path_str, None)
+
+
+# --------------------
+# Output folder planner (YYYY/MM + split into 001 only after >limit)
+# --------------------
+def list_files_in_dir(dir_path: Path) -> list[Path]:
+    if not dir_path.exists():
+        return []
+    return [p for p in dir_path.iterdir() if p.is_file()]
 
 def move_month_root_files_into_001(month_root: Path, dry_run: bool, fp, fail_fast: bool):
     root_files = list_files_in_dir(month_root)
@@ -156,16 +205,16 @@ def move_month_root_files_into_001(month_root: Path, dry_run: bool, fp, fail_fas
         return
     target_dir = month_root / "001"
     if dry_run:
-        log(fp, f"[SPLIT-INIT] Would move {len(root_files)} files: {month_root} -> {target_dir}")
+        # 이건 정책 변경이므로 report에 남길 가치가 큼
+        log_report(fp, f"[SPLIT-INIT] Would move {len(root_files)} files: {month_root} -> {target_dir}")
         return
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         for f in root_files:
             safe_move(f, target_dir / f.name)
-        log(fp, f"[SPLIT-INIT] Moved {len(root_files)} files into {target_dir}")
+        log_report(fp, f"[SPLIT-INIT] Moved {len(root_files)} files into {target_dir}")
     except Exception as e:
         fail_or_continue(fp, fail_fast, f"[ERR] split-init move failed for {month_root}", e)
-
 
 class YMFolderPlanner:
     def __init__(self, base_root: Path, limit: int, dry_run: bool, fp, fail_fast: bool):
@@ -185,7 +234,6 @@ class YMFolderPlanner:
 
         split_dirs = sorted([p for p in month_root.iterdir()
                              if p.is_dir() and p.name.isdigit() and len(p.name) == 3])
-
         if split_dirs:
             last = split_dirs[-1]
             part = int(last.name)
@@ -210,7 +258,8 @@ class YMFolderPlanner:
 
         if st["mode"] == "flat":
             if st["flat_count"] + 1 > self.limit:
-                log(self.fp, f"[SPLIT] Switching to split mode for {yyyy}/{mm} (limit={self.limit})")
+                # 정책 전환은 report에 남김(중요 이벤트)
+                log_report(self.fp, f"[SPLIT] Switching to split mode for {yyyy}/{mm} (limit={self.limit})")
                 self._switch_to_split_mode(yyyy, mm)
                 st = self.state[(yyyy, mm)]
             else:
@@ -228,21 +277,28 @@ class YMFolderPlanner:
         return month_root / f"{part:03d}" / filename
 
 
+def choose_keep(paths: list[Path]) -> Path:
+    def key(p: Path):
+        return (len(p.name), str(p).lower())
+    return min(paths, key=key)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("input", help="원본 폴더")
-    ap.add_argument("output", help="정리 결과 폴더(ORGANIZED)")
-    ap.add_argument("--dups", default="DUPLICATES", help="중복 이동 폴더")
-    ap.add_argument("--limit", type=int, default=1000, help="월 폴더당 최대 파일 수")
-    ap.add_argument("--delete", action="store_true", help="중복 파일 영구 삭제(주의)")
-    ap.add_argument("--dry-run", action="store_true", help="실제 이동/삭제 없이 로그만")
-    ap.add_argument("--workers", type=int, default=1, help="해시 워커 수(기본 1)")
-    ap.add_argument("--fail-fast", action="store_true", help="에러 즉시 중단")
-    ap.add_argument("--report", default="report.txt", help="리포트 경로")
+    ap.add_argument("input")
+    ap.add_argument("output")
+    ap.add_argument("--dups", default="DUPLICATES")
+    ap.add_argument("--limit", type=int, default=1000)
+    ap.add_argument("--delete", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--fail-fast", action="store_true")
+    ap.add_argument("--report", default="report.txt")
     ap.add_argument("--head-tail-kb", type=int, default=64)
     ap.add_argument("--chunk-mb", type=int, default=2)
-    ap.add_argument("--progress-every", type=int, default=500, help="스캔/처리 진행 로그 주기(개수)")
-    ap.add_argument("--heartbeat-seconds", type=int, default=10, help="RUNNING 파일 갱신 주기(초)")
+    ap.add_argument("--hash-timeout-sec", type=float, default=10.0, help="한 파일 해시 처리 타임아웃(초)")
+    ap.add_argument("--progress-every", type=int, default=500, help="콘솔 진행 로그 주기")
+    ap.add_argument("--heartbeat-seconds", type=int, default=10)
     args = ap.parse_args()
 
     in_root = Path(args.input).resolve()
@@ -250,7 +306,7 @@ def main():
     dup_root = Path(args.dups).resolve()
     report_path = Path(args.report).resolve()
 
-    # Create base folders immediately (even in dry-run) so you can see something
+    # Start visibility immediately (even in dry-run)
     out_root.mkdir(parents=True, exist_ok=True)
     dup_root.mkdir(parents=True, exist_ok=True)
     running_marker = out_root / ".RUNNING"
@@ -259,19 +315,20 @@ def main():
     last_hb = 0.0
 
     with open(report_path, "w", encoding="utf-8") as fp:
-        log(fp, f"START {datetime.now().isoformat()}")
-        log(fp, f"Input: {in_root}")
-        log(fp, f"Output: {out_root} | Dups: {dup_root}")
-        log(fp, f"DryRun={args.dry_run} Delete={args.delete} Workers={args.workers} FailFast={args.fail_fast}")
-        log(fp, f"Pillow(EXIF)={PIL_AVAILABLE}")
-        log(fp, "")
+        # report에는 "중요한 것"만
+        log_report(fp, f"START {datetime.now().isoformat()}")
+        log_report(fp, f"Input={in_root}")
+        log_report(fp, f"Output={out_root} Dups={dup_root}")
+        log_report(fp, f"DryRun={args.dry_run} Delete={args.delete} Workers={args.workers} FailFast={args.fail_fast}")
+        log_report(fp, f"Pillow(EXIF)={PIL_AVAILABLE}")
+        log_report(fp, f"HashTimeoutSec={args.hash_timeout_sec}")
+        log_report(fp, "")
 
-        # ---- Scan & stat (this can take long; show progress) ----
+        # 콘솔에만 스캔 진행 표시
+        log_console("[SCAN] walking files... (console-only)")
         by_size = defaultdict(list)
         total_bytes = 0
         files_found = 0
-
-        log(fp, "[SCAN] walking files... (this can take a while on HDD)")
 
         for p in iter_images_stream(in_root):
             files_found += 1
@@ -283,101 +340,125 @@ def main():
                 fail_or_continue(fp, args.fail_fast, f"[ERR] stat failed: {p}", e)
 
             if files_found % args.progress_every == 0:
-                log(fp, f"[SCAN] found={files_found}, total_size={format_bytes(total_bytes)}", also_print=True)
+                log_console(f"[SCAN] found={files_found}, total_size={format_bytes(total_bytes)}")
 
             now = time.time()
             if now - last_hb >= args.heartbeat_seconds:
                 heartbeat(running_marker)
                 last_hb = now
 
-        log(fp, f"[SCAN DONE] images={files_found}, total_size={format_bytes(total_bytes)}")
-        log(fp, "")
+        log_console(f"[SCAN DONE] images={files_found}, total_size={format_bytes(total_bytes)}")
+        log_report(fp, f"SCAN_DONE images={files_found} total_size={format_bytes(total_bytes)}")
+        log_report(fp, "")
 
-        # ---- Hash planning ----
+        # quick-hash 대상
         size_groups = [g for g in by_size.values() if len(g) > 1]
         q_targets = [str(p) for g in size_groups for p in g]
-        log(fp, f"[PLAN] size-collision candidates={len(q_targets)} (need quick-hash)")
-        heartbeat(running_marker)
+        log_console(f"[PLAN] quick candidates={len(q_targets)}")
+        log_report(fp, f"PLAN quick_candidates={len(q_targets)}")
 
-        # ---- Quick-hash ----
+        # quick-hash (콘솔 진행만)
         quick_map = defaultdict(list)
-        errors_hash = 0
+        skipped_quick = 0
 
         if q_targets:
-            log(fp, "[QUICK] start")
+            log_console("[QUICK] start (console-only)")
             if args.workers == 1:
                 for i, ps in enumerate(q_targets, 1):
+                    path_str, qh = quick_hash_timeout(ps, args.head_tail_kb, args.hash_timeout_sec)
+                    if qh is None:
+                        skipped_quick += 1
+                        log_report(fp, f"[SKIP QUICK] {path_str} (timeout/err)")
+                        continue
+                    p = Path(path_str)
                     try:
-                        _, qh = quick_hash(ps, args.head_tail_kb)
-                        p = Path(ps)
-                        quick_map[(p.stat().st_size, qh)].append(p)
-                    except Exception as e:
-                        errors_hash += 1
-                        fail_or_continue(fp, args.fail_fast, f"[ERR] quick-hash failed: {ps}", e)
+                        sz = p.stat().st_size
+                    except Exception:
+                        skipped_quick += 1
+                        log_report(fp, f"[SKIP QUICK] {path_str} (stat fail after hash)")
+                        continue
+                    quick_map[(sz, qh)].append(p)
 
                     if i % args.progress_every == 0:
-                        log(fp, f"[QUICK] done={i}/{len(q_targets)}", also_print=True)
+                        log_console(f"[QUICK] done={i}/{len(q_targets)} skipped={skipped_quick}")
                         heartbeat(running_marker)
+
             else:
+                # 멀티프로세스: worker가 느린 파일에 오래 걸릴 수 있으니 timeout-sec를 짧게 잡는 걸 추천
                 with ProcessPoolExecutor(max_workers=args.workers) as ex:
-                    futs = {ex.submit(quick_hash, ps, args.head_tail_kb): ps for ps in q_targets}
+                    futs = {ex.submit(quick_hash_timeout, ps, args.head_tail_kb, args.hash_timeout_sec): ps for ps in q_targets}
                     done = 0
                     for fut in as_completed(futs):
-                        ps = futs[fut]
                         done += 1
                         try:
-                            _, qh = fut.result()
-                            p = Path(ps)
-                            quick_map[(p.stat().st_size, qh)].append(p)
+                            path_str, qh = fut.result()
+                            if qh is None:
+                                skipped_quick += 1
+                                log_report(fp, f"[SKIP QUICK] {path_str} (timeout/err)")
+                            else:
+                                p = Path(path_str)
+                                sz = p.stat().st_size
+                                quick_map[(sz, qh)].append(p)
                         except Exception as e:
-                            errors_hash += 1
-                            fail_or_continue(fp, args.fail_fast, f"[ERR] quick-hash failed: {ps}", e)
+                            skipped_quick += 1
+                            log_report(fp, f"[SKIP QUICK] {futs[fut]} (worker exception: {e})")
+                            if args.fail_fast:
+                                raise
 
                         if done % args.progress_every == 0:
-                            log(fp, f"[QUICK] done={done}/{len(q_targets)}", also_print=True)
+                            log_console(f"[QUICK] done={done}/{len(q_targets)} skipped={skipped_quick}")
                             heartbeat(running_marker)
 
-            log(fp, "[QUICK DONE]")
+            log_console(f"[QUICK DONE] skipped={skipped_quick}")
+            log_report(fp, f"QUICK_DONE skipped={skipped_quick}")
 
-        # ---- Full-hash for quick collisions ----
+        # full-hash 대상
         full_targets = [str(p) for (_, _), lst in quick_map.items() if len(lst) > 1 for p in lst]
-        log(fp, f"[PLAN] quick-collision candidates={len(full_targets)} (need full-hash)")
-        heartbeat(running_marker)
+        log_console(f"[PLAN] full candidates={len(full_targets)}")
+        log_report(fp, f"PLAN full_candidates={len(full_targets)}")
 
         full_groups = defaultdict(list)
+        skipped_full = 0
+
         if full_targets:
-            log(fp, "[FULL] start")
+            log_console("[FULL] start (console-only)")
             if args.workers == 1:
                 for i, ps in enumerate(full_targets, 1):
-                    try:
-                        _, fh = full_hash(ps, args.chunk_mb)
-                        full_groups[fh].append(Path(ps))
-                    except Exception as e:
-                        errors_hash += 1
-                        fail_or_continue(fp, args.fail_fast, f"[ERR] full-hash failed: {ps}", e)
+                    path_str, fh = full_hash_timeout(ps, args.chunk_mb, args.hash_timeout_sec)
+                    if fh is None:
+                        skipped_full += 1
+                        log_report(fp, f"[SKIP FULL] {path_str} (timeout/err)")
+                        continue
+                    full_groups[fh].append(Path(path_str))
 
                     if i % args.progress_every == 0:
-                        log(fp, f"[FULL] done={i}/{len(full_targets)}", also_print=True)
+                        log_console(f"[FULL] done={i}/{len(full_targets)} skipped={skipped_full}")
                         heartbeat(running_marker)
             else:
                 with ProcessPoolExecutor(max_workers=args.workers) as ex:
-                    futs = {ex.submit(full_hash, ps, args.chunk_mb): ps for ps in full_targets}
+                    futs = {ex.submit(full_hash_timeout, ps, args.chunk_mb, args.hash_timeout_sec): ps for ps in full_targets}
                     done = 0
                     for fut in as_completed(futs):
-                        ps = futs[fut]
                         done += 1
                         try:
-                            _, fh = fut.result()
-                            full_groups[fh].append(Path(ps))
+                            path_str, fh = fut.result()
+                            if fh is None:
+                                skipped_full += 1
+                                log_report(fp, f"[SKIP FULL] {path_str} (timeout/err)")
+                            else:
+                                full_groups[fh].append(Path(path_str))
                         except Exception as e:
-                            errors_hash += 1
-                            fail_or_continue(fp, args.fail_fast, f"[ERR] full-hash failed: {ps}", e)
+                            skipped_full += 1
+                            log_report(fp, f"[SKIP FULL] {futs[fut]} (worker exception: {e})")
+                            if args.fail_fast:
+                                raise
 
                         if done % args.progress_every == 0:
-                            log(fp, f"[FULL] done={done}/{len(full_targets)}", also_print=True)
+                            log_console(f"[FULL] done={done}/{len(full_targets)} skipped={skipped_full}")
                             heartbeat(running_marker)
 
-            log(fp, "[FULL DONE]")
+            log_console(f"[FULL DONE] skipped={skipped_full}")
+            log_report(fp, f"FULL_DONE skipped={skipped_full}")
 
         duplicate_hashes = {h for h, lst in full_groups.items() if len(lst) > 1}
         keep_for_hash = {h: choose_keep(lst) for h, lst in full_groups.items() if len(lst) > 1}
@@ -387,8 +468,8 @@ def main():
             for p in lst:
                 file_to_fullhash[str(p)] = h
 
-        log(fp, f"[DEDUPE] duplicate_groups={len(duplicate_hashes)}")
-        heartbeat(running_marker)
+        log_report(fp, f"DEDUPE duplicate_groups={len(duplicate_hashes)}")
+        log_report(fp, "")
 
         planner_unique = YMFolderPlanner(out_root, args.limit, args.dry_run, fp, args.fail_fast)
         planner_dups = YMFolderPlanner(dup_root, args.limit, args.dry_run, fp, args.fail_fast)
@@ -397,69 +478,65 @@ def main():
         handled_dups = 0
         saved_bytes = 0
 
-        # ---- Apply stage ----
-        log(fp, "[APPLY] start (dry-run will not move/delete files)")
-        heartbeat(running_marker)
-
-        # If dry-run, we still want visible progress without spamming per-file logs.
-        # We only log every progress-every files during apply in dry-run.
-        processed = 0
-
-        # We need all images again; we can iterate by by_size values to avoid rescanning disk,
-        # but by_size already contains Paths, so we can just flatten:
+        # apply는 console로만 진행률, report에는 요약만
+        log_console("[APPLY] start")
         all_paths = [p for group in by_size.values() for p in group]
+        processed = 0
 
         for p in all_paths:
             processed += 1
             fh = file_to_fullhash.get(str(p))
 
-            if fh in duplicate_hashes:
-                keep_p = keep_for_hash[fh]
-                if p == keep_p:
+            try:
+                if fh in duplicate_hashes:
+                    keep_p = keep_for_hash[fh]
+                    if p == keep_p:
+                        yyyy, mm = get_year_month(p)
+                        dst = planner_unique.next_destination(yyyy, mm, p.name)
+                        if not args.dry_run:
+                            safe_move(p, dst)
+                        moved_unique += 1
+                    else:
+                        saved_bytes += p.stat().st_size
+                        if args.delete:
+                            if not args.dry_run:
+                                safe_delete(p)
+                        else:
+                            yyyy, mm = get_year_month(p)
+                            dst = planner_dups.next_destination(yyyy, mm, p.name)
+                            if not args.dry_run:
+                                safe_move(p, dst)
+                        handled_dups += 1
+                else:
                     yyyy, mm = get_year_month(p)
                     dst = planner_unique.next_destination(yyyy, mm, p.name)
                     if not args.dry_run:
                         safe_move(p, dst)
                     moved_unique += 1
-                else:
-                    saved_bytes += p.stat().st_size
-                    if args.delete:
-                        if not args.dry_run:
-                            safe_delete(p)
-                    else:
-                        yyyy, mm = get_year_month(p)
-                        dst = planner_dups.next_destination(yyyy, mm, p.name)
-                        if not args.dry_run:
-                            safe_move(p, dst)
-                    handled_dups += 1
-            else:
-                yyyy, mm = get_year_month(p)
-                dst = planner_unique.next_destination(yyyy, mm, p.name)
-                if not args.dry_run:
-                    safe_move(p, dst)
-                moved_unique += 1
+            except Exception as e:
+                fail_or_continue(fp, args.fail_fast, f"[ERR] apply failed: {p}", e)
 
             if processed % args.progress_every == 0:
-                log(fp, f"[APPLY] processed={processed}/{len(all_paths)} | unique={moved_unique} dups={handled_dups}", also_print=True)
+                log_console(f"[APPLY] processed={processed}/{len(all_paths)} unique={moved_unique} dups={handled_dups}")
                 heartbeat(running_marker)
 
         elapsed = time.time() - t0
-        log(fp, "")
-        log(fp, "=== Summary ===")
-        log(fp, f"Unique: {moved_unique}")
-        log(fp, f"Dups handled: {handled_dups}")
-        log(fp, f"Saved space (dups): {format_bytes(saved_bytes)}")
-        log(fp, f"Hash errors: {errors_hash}")
-        log(fp, f"Elapsed: {elapsed:.2f}s")
+        log_report(fp, "=== Summary ===")
+        log_report(fp, f"Unique={moved_unique}")
+        log_report(fp, f"DupsHandled={handled_dups}")
+        log_report(fp, f"SavedSpace={format_bytes(saved_bytes)}")
+        log_report(fp, f"SkippedQuick={skipped_quick}")
+        log_report(fp, f"SkippedFull={skipped_full}")
+        log_report(fp, f"ElapsedSec={elapsed:.2f}")
 
-    # mark completed
+    # mark done
     try:
-        (out_root / ".RUNNING").unlink(missing_ok=True)
+        running_marker.unlink(missing_ok=True)
         (out_root / ".DONE").write_text(f"DONE {datetime.now().isoformat()}\n", encoding="utf-8")
     except Exception:
         pass
 
-    print(f"Done. Report: {report_path}")
+    log_console(f"Done. Report: {report_path}")
 
 
 if __name__ == "__main__":
