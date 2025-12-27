@@ -3,7 +3,6 @@ import os
 import time
 import shutil
 import hashlib
-import sys
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -24,14 +23,14 @@ except Exception:
     TAG_DT = None
 
 
-def iter_images(root: Path):
+def iter_images_stream(root: Path):
+    """Generator: yields image paths without materializing full list."""
     for p in root.rglob("*"):
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
             yield p
 
 
 def get_year_month(path: Path) -> tuple[str, str]:
-    """(YYYY, MM) using EXIF DateTimeOriginal if possible; else file mtime."""
     if PIL_AVAILABLE and path.suffix.lower() in {".jpg", ".jpeg", ".tif", ".tiff", ".webp"}:
         try:
             with Image.open(path) as img:
@@ -42,7 +41,6 @@ def get_year_month(path: Path) -> tuple[str, str]:
                         dt_str = exif.get(TAG_DTO)
                     elif TAG_DT and TAG_DT in exif:
                         dt_str = exif.get(TAG_DT)
-
                     if isinstance(dt_str, str) and len(dt_str) >= 19:
                         try:
                             dt = datetime.strptime(dt_str[:19], "%Y:%m:%d %H:%M:%S")
@@ -51,7 +49,6 @@ def get_year_month(path: Path) -> tuple[str, str]:
                             pass
         except Exception:
             pass
-
     dt = datetime.fromtimestamp(path.stat().st_mtime)
     return f"{dt.year:04d}", f"{dt.month:02d}"
 
@@ -86,7 +83,6 @@ def format_bytes(n: int) -> str:
     return f"{v:.2f}PB"
 
 
-# ---------- Hashing ----------
 def _blake2b_small(data: bytes) -> str:
     h = hashlib.blake2b(digest_size=20)
     h.update(data)
@@ -121,7 +117,6 @@ def full_hash(path_str: str, chunk_mb: int = 2) -> tuple[str, str]:
 
 
 def choose_keep(paths: list[Path]) -> Path:
-    """Keep shortest filename; tie -> lexicographically smallest full path (case-insensitive)."""
     def key(p: Path):
         return (len(p.name), str(p).lower())
     return min(paths, key=key)
@@ -133,9 +128,17 @@ def list_files_in_dir(dir_path: Path) -> list[Path]:
     return [p for p in dir_path.iterdir() if p.is_file()]
 
 
-def log(fp, msg: str):
+def log(fp, msg: str, also_print: bool = True):
     fp.write(msg + "\n")
     fp.flush()
+    if also_print:
+        print(msg, flush=True)
+
+
+def heartbeat(path: Path):
+    # update timestamp in a file so user can see activity in Explorer
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"RUNNING {datetime.now().isoformat()}\n", encoding="utf-8")
 
 
 def fail_or_continue(fp, fail_fast: bool, msg: str, exc: Exception | None = None):
@@ -148,16 +151,13 @@ def fail_or_continue(fp, fail_fast: bool, msg: str, exc: Exception | None = None
 
 
 def move_month_root_files_into_001(month_root: Path, dry_run: bool, fp, fail_fast: bool):
-    """Policy A: when splitting starts, move month-root files into YYYY/MM/001."""
     root_files = list_files_in_dir(month_root)
     if not root_files:
         return
-
     target_dir = month_root / "001"
     if dry_run:
         log(fp, f"[SPLIT-INIT] Would move {len(root_files)} files: {month_root} -> {target_dir}")
         return
-
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         for f in root_files:
@@ -168,29 +168,23 @@ def move_month_root_files_into_001(month_root: Path, dry_run: bool, fp, fail_fas
 
 
 class YMFolderPlanner:
-    """
-    Output structure:
-      base/YYYY/MM/  (flat if <=limit)
-      base/YYYY/MM/001, 002... (split if exceeds; Policy A moves month-root files into 001)
-    """
     def __init__(self, base_root: Path, limit: int, dry_run: bool, fp, fail_fast: bool):
         self.base_root = base_root
         self.limit = limit
         self.dry_run = dry_run
         self.fp = fp
         self.fail_fast = fail_fast
-        self.state = {}  # (yyyy,mm) -> dict
+        self.state = {}
 
     def _init_state_from_disk(self, yyyy: str, mm: str):
         key = (yyyy, mm)
         if key in self.state:
             return
-
         month_root = self.base_root / yyyy / mm
         month_root.mkdir(parents=True, exist_ok=True)
 
         split_dirs = sorted([p for p in month_root.iterdir()
-                            if p.is_dir() and p.name.isdigit() and len(p.name) == 3])
+                             if p.is_dir() and p.name.isdigit() and len(p.name) == 3])
 
         if split_dirs:
             last = split_dirs[-1]
@@ -204,7 +198,6 @@ class YMFolderPlanner:
     def _switch_to_split_mode(self, yyyy: str, mm: str):
         month_root = self.base_root / yyyy / mm
         move_month_root_files_into_001(month_root, self.dry_run, self.fp, self.fail_fast)
-
         count_in_001 = 0
         if (month_root / "001").exists():
             count_in_001 = len([p for p in (month_root / "001").iterdir() if p.is_file()])
@@ -241,212 +234,238 @@ def main():
     ap.add_argument("output", help="정리 결과 폴더(ORGANIZED)")
     ap.add_argument("--dups", default="DUPLICATES", help="중복 이동 폴더")
     ap.add_argument("--limit", type=int, default=1000, help="월 폴더당 최대 파일 수")
-    ap.add_argument("--delete", action="store_true", help="중복 파일을 이동 대신 영구 삭제(주의)")
-    ap.add_argument("--dry-run", action="store_true", help="실제 이동/삭제 없이 로그만 생성")
-    ap.add_argument("--workers", type=int, default=1, help="해시 병렬 워커 수(기본 1: 안전)")
-    ap.add_argument("--fail-fast", action="store_true", help="에러 1개라도 나면 즉시 중단(안전)")
-    ap.add_argument("--report", default="report.txt", help="리포트 txt 파일 경로")
-    ap.add_argument("--head-tail-kb", type=int, default=64, help="quick-hash head/tail 크기(KB)")
-    ap.add_argument("--chunk-mb", type=int, default=2, help="full-hash chunk size(MB)")
+    ap.add_argument("--delete", action="store_true", help="중복 파일 영구 삭제(주의)")
+    ap.add_argument("--dry-run", action="store_true", help="실제 이동/삭제 없이 로그만")
+    ap.add_argument("--workers", type=int, default=1, help="해시 워커 수(기본 1)")
+    ap.add_argument("--fail-fast", action="store_true", help="에러 즉시 중단")
+    ap.add_argument("--report", default="report.txt", help="리포트 경로")
+    ap.add_argument("--head-tail-kb", type=int, default=64)
+    ap.add_argument("--chunk-mb", type=int, default=2)
+    ap.add_argument("--progress-every", type=int, default=500, help="스캔/처리 진행 로그 주기(개수)")
+    ap.add_argument("--heartbeat-seconds", type=int, default=10, help="RUNNING 파일 갱신 주기(초)")
     args = ap.parse_args()
 
-    t0 = time.time()
     in_root = Path(args.input).resolve()
     out_root = Path(args.output).resolve()
     dup_root = Path(args.dups).resolve()
     report_path = Path(args.report).resolve()
 
-    images = list(iter_images(in_root))
-    if not images:
-        print("No images found.")
-        return
+    # Create base folders immediately (even in dry-run) so you can see something
+    out_root.mkdir(parents=True, exist_ok=True)
+    dup_root.mkdir(parents=True, exist_ok=True)
+    running_marker = out_root / ".RUNNING"
 
-    # Stream log from start
+    t0 = time.time()
+    last_hb = 0.0
+
     with open(report_path, "w", encoding="utf-8") as fp:
-        log(fp, "=== Photo Organizer Report (Safe) ===")
-        log(fp, f"Input:  {in_root}")
-        log(fp, f"Output: {out_root}  (YYYY/MM/[001..])")
-        log(fp, f"Dups:   {dup_root}  (YYYY/MM/[001..])")
-        log(fp, f"Limit:  {args.limit} files per month")
-        log(fp, f"Mode:   {'DELETE duplicates' if args.delete else 'MOVE duplicates'}")
-        log(fp, f"DryRun: {args.dry_run}")
-        log(fp, f"Workers:{args.workers}")
-        log(fp, f"FailFast:{args.fail_fast}")
-        if not PIL_AVAILABLE:
-            log(fp, "Note: Pillow 미설치 -> EXIF 촬영일 미사용, mtime 기준 월 분류")
-            log(fp, "      EXIF 사용: pip install pillow")
+        log(fp, f"START {datetime.now().isoformat()}")
+        log(fp, f"Input: {in_root}")
+        log(fp, f"Output: {out_root} | Dups: {dup_root}")
+        log(fp, f"DryRun={args.dry_run} Delete={args.delete} Workers={args.workers} FailFast={args.fail_fast}")
+        log(fp, f"Pillow(EXIF)={PIL_AVAILABLE}")
         log(fp, "")
 
-        # 1) size grouping
+        # ---- Scan & stat (this can take long; show progress) ----
         by_size = defaultdict(list)
         total_bytes = 0
-        stat_fail = 0
+        files_found = 0
 
-        for p in images:
+        log(fp, "[SCAN] walking files... (this can take a while on HDD)")
+
+        for p in iter_images_stream(in_root):
+            files_found += 1
             try:
                 st = p.stat()
                 total_bytes += st.st_size
                 by_size[st.st_size].append(p)
             except Exception as e:
-                stat_fail += 1
                 fail_or_continue(fp, args.fail_fast, f"[ERR] stat failed: {p}", e)
 
-        log(fp, f"Total images found: {len(images)}")
-        log(fp, f"Total input size: {format_bytes(total_bytes)}")
-        if stat_fail:
-            log(fp, f"Stat failures: {stat_fail}")
+            if files_found % args.progress_every == 0:
+                log(fp, f"[SCAN] found={files_found}, total_size={format_bytes(total_bytes)}", also_print=True)
+
+            now = time.time()
+            if now - last_hb >= args.heartbeat_seconds:
+                heartbeat(running_marker)
+                last_hb = now
+
+        log(fp, f"[SCAN DONE] images={files_found}, total_size={format_bytes(total_bytes)}")
         log(fp, "")
 
-        # 2) quick-hash only for size groups with >1
+        # ---- Hash planning ----
         size_groups = [g for g in by_size.values() if len(g) > 1]
         q_targets = [str(p) for g in size_groups for p in g]
+        log(fp, f"[PLAN] size-collision candidates={len(q_targets)} (need quick-hash)")
+        heartbeat(running_marker)
 
+        # ---- Quick-hash ----
+        quick_map = defaultdict(list)
         errors_hash = 0
 
-        quick_map = defaultdict(list)  # (size, quickhex) -> [Path...]
         if q_targets:
-            try:
-                if args.workers == 1:
-                    # single-process: simpler + more predictable
-                    for ps in q_targets:
+            log(fp, "[QUICK] start")
+            if args.workers == 1:
+                for i, ps in enumerate(q_targets, 1):
+                    try:
+                        _, qh = quick_hash(ps, args.head_tail_kb)
+                        p = Path(ps)
+                        quick_map[(p.stat().st_size, qh)].append(p)
+                    except Exception as e:
+                        errors_hash += 1
+                        fail_or_continue(fp, args.fail_fast, f"[ERR] quick-hash failed: {ps}", e)
+
+                    if i % args.progress_every == 0:
+                        log(fp, f"[QUICK] done={i}/{len(q_targets)}", also_print=True)
+                        heartbeat(running_marker)
+            else:
+                with ProcessPoolExecutor(max_workers=args.workers) as ex:
+                    futs = {ex.submit(quick_hash, ps, args.head_tail_kb): ps for ps in q_targets}
+                    done = 0
+                    for fut in as_completed(futs):
+                        ps = futs[fut]
+                        done += 1
                         try:
-                            _, qh = quick_hash(ps, args.head_tail_kb)
+                            _, qh = fut.result()
                             p = Path(ps)
-                            sz = p.stat().st_size
-                            quick_map[(sz, qh)].append(p)
+                            quick_map[(p.stat().st_size, qh)].append(p)
                         except Exception as e:
                             errors_hash += 1
                             fail_or_continue(fp, args.fail_fast, f"[ERR] quick-hash failed: {ps}", e)
-                else:
-                    with ProcessPoolExecutor(max_workers=args.workers) as ex:
-                        futs = {ex.submit(quick_hash, ps, args.head_tail_kb): ps for ps in q_targets}
-                        for fut in as_completed(futs):
-                            ps = futs[fut]
-                            try:
-                                _, qh = fut.result()
-                                p = Path(ps)
-                                sz = p.stat().st_size
-                                quick_map[(sz, qh)].append(p)
-                            except Exception as e:
-                                errors_hash += 1
-                                fail_or_continue(fp, args.fail_fast, f"[ERR] quick-hash failed: {ps}", e)
-            except Exception as e:
-                fail_or_continue(fp, args.fail_fast, "[ERR] quick-hash stage crashed", e)
 
-        # 3) full-hash for quick collisions
+                        if done % args.progress_every == 0:
+                            log(fp, f"[QUICK] done={done}/{len(q_targets)}", also_print=True)
+                            heartbeat(running_marker)
+
+            log(fp, "[QUICK DONE]")
+
+        # ---- Full-hash for quick collisions ----
         full_targets = [str(p) for (_, _), lst in quick_map.items() if len(lst) > 1 for p in lst]
-        full_groups = defaultdict(list)  # fullhex -> [Path...]
+        log(fp, f"[PLAN] quick-collision candidates={len(full_targets)} (need full-hash)")
+        heartbeat(running_marker)
+
+        full_groups = defaultdict(list)
         if full_targets:
-            try:
-                if args.workers == 1:
-                    for ps in full_targets:
+            log(fp, "[FULL] start")
+            if args.workers == 1:
+                for i, ps in enumerate(full_targets, 1):
+                    try:
+                        _, fh = full_hash(ps, args.chunk_mb)
+                        full_groups[fh].append(Path(ps))
+                    except Exception as e:
+                        errors_hash += 1
+                        fail_or_continue(fp, args.fail_fast, f"[ERR] full-hash failed: {ps}", e)
+
+                    if i % args.progress_every == 0:
+                        log(fp, f"[FULL] done={i}/{len(full_targets)}", also_print=True)
+                        heartbeat(running_marker)
+            else:
+                with ProcessPoolExecutor(max_workers=args.workers) as ex:
+                    futs = {ex.submit(full_hash, ps, args.chunk_mb): ps for ps in full_targets}
+                    done = 0
+                    for fut in as_completed(futs):
+                        ps = futs[fut]
+                        done += 1
                         try:
-                            _, fh = full_hash(ps, args.chunk_mb)
+                            _, fh = fut.result()
                             full_groups[fh].append(Path(ps))
                         except Exception as e:
                             errors_hash += 1
                             fail_or_continue(fp, args.fail_fast, f"[ERR] full-hash failed: {ps}", e)
-                else:
-                    with ProcessPoolExecutor(max_workers=args.workers) as ex:
-                        futs = {ex.submit(full_hash, ps, args.chunk_mb): ps for ps in full_targets}
-                        for fut in as_completed(futs):
-                            ps = futs[fut]
-                            try:
-                                _, fh = fut.result()
-                                full_groups[fh].append(Path(ps))
-                            except Exception as e:
-                                errors_hash += 1
-                                fail_or_continue(fp, args.fail_fast, f"[ERR] full-hash failed: {ps}", e)
-            except Exception as e:
-                fail_or_continue(fp, args.fail_fast, "[ERR] full-hash stage crashed", e)
+
+                        if done % args.progress_every == 0:
+                            log(fp, f"[FULL] done={done}/{len(full_targets)}", also_print=True)
+                            heartbeat(running_marker)
+
+            log(fp, "[FULL DONE]")
 
         duplicate_hashes = {h for h, lst in full_groups.items() if len(lst) > 1}
         keep_for_hash = {h: choose_keep(lst) for h, lst in full_groups.items() if len(lst) > 1}
 
-        # file -> fullhash lookup only for those hashed fully
         file_to_fullhash = {}
         for h, lst in full_groups.items():
             for p in lst:
                 file_to_fullhash[str(p)] = h
 
-        # planners
+        log(fp, f"[DEDUPE] duplicate_groups={len(duplicate_hashes)}")
+        heartbeat(running_marker)
+
         planner_unique = YMFolderPlanner(out_root, args.limit, args.dry_run, fp, args.fail_fast)
         planner_dups = YMFolderPlanner(dup_root, args.limit, args.dry_run, fp, args.fail_fast)
 
         moved_unique = 0
         handled_dups = 0
         saved_bytes = 0
-        move_errors = 0
-        delete_errors = 0
 
-        # 4) apply moves/deletes
-        for p in images:
-            sp = str(p)
-            fh = file_to_fullhash.get(sp)
+        # ---- Apply stage ----
+        log(fp, "[APPLY] start (dry-run will not move/delete files)")
+        heartbeat(running_marker)
 
-            try:
-                if fh in duplicate_hashes:
-                    keep_p = keep_for_hash[fh]
-                    if p == keep_p:
-                        yyyy, mm = get_year_month(p)
-                        dst = planner_unique.next_destination(yyyy, mm, p.name)
-                        if args.dry_run:
-                            log(fp, f"[KEEP->ORG] {p} -> {dst} (hash={fh})")
-                        else:
-                            safe_move(p, dst)
-                        moved_unique += 1
-                    else:
-                        saved_bytes += p.stat().st_size
-                        if args.delete:
-                            if args.dry_run:
-                                log(fp, f"[DEL DUP] {p} (kept={keep_p}, hash={fh})")
-                            else:
-                                safe_delete(p)
-                        else:
-                            yyyy, mm = get_year_month(p)
-                            dst = planner_dups.next_destination(yyyy, mm, p.name)
-                            if args.dry_run:
-                                log(fp, f"[MOVE DUP] {p} -> {dst} (kept={keep_p}, hash={fh})")
-                            else:
-                                safe_move(p, dst)
-                        handled_dups += 1
-                else:
+        # If dry-run, we still want visible progress without spamming per-file logs.
+        # We only log every progress-every files during apply in dry-run.
+        processed = 0
+
+        # We need all images again; we can iterate by by_size values to avoid rescanning disk,
+        # but by_size already contains Paths, so we can just flatten:
+        all_paths = [p for group in by_size.values() for p in group]
+
+        for p in all_paths:
+            processed += 1
+            fh = file_to_fullhash.get(str(p))
+
+            if fh in duplicate_hashes:
+                keep_p = keep_for_hash[fh]
+                if p == keep_p:
                     yyyy, mm = get_year_month(p)
                     dst = planner_unique.next_destination(yyyy, mm, p.name)
-                    if args.dry_run:
-                        log(fp, f"[MOVE] {p} -> {dst}")
-                    else:
+                    if not args.dry_run:
                         safe_move(p, dst)
                     moved_unique += 1
-
-            except Exception as e:
-                # errors here are critical because they may stop mid-run
-                if args.delete:
-                    delete_errors += 1
                 else:
-                    move_errors += 1
-                fail_or_continue(fp, args.fail_fast, f"[ERR] apply stage failed: {p}", e)
+                    saved_bytes += p.stat().st_size
+                    if args.delete:
+                        if not args.dry_run:
+                            safe_delete(p)
+                    else:
+                        yyyy, mm = get_year_month(p)
+                        dst = planner_dups.next_destination(yyyy, mm, p.name)
+                        if not args.dry_run:
+                            safe_move(p, dst)
+                    handled_dups += 1
+            else:
+                yyyy, mm = get_year_month(p)
+                dst = planner_unique.next_destination(yyyy, mm, p.name)
+                if not args.dry_run:
+                    safe_move(p, dst)
+                moved_unique += 1
+
+            if processed % args.progress_every == 0:
+                log(fp, f"[APPLY] processed={processed}/{len(all_paths)} | unique={moved_unique} dups={handled_dups}", also_print=True)
+                heartbeat(running_marker)
 
         elapsed = time.time() - t0
         log(fp, "")
         log(fp, "=== Summary ===")
-        log(fp, f"Unique moved: {moved_unique}")
-        log(fp, f"Duplicates handled: {handled_dups}")
-        log(fp, f"Saved space from duplicates: {format_bytes(saved_bytes)}")
+        log(fp, f"Unique: {moved_unique}")
+        log(fp, f"Dups handled: {handled_dups}")
+        log(fp, f"Saved space (dups): {format_bytes(saved_bytes)}")
         log(fp, f"Hash errors: {errors_hash}")
-        log(fp, f"Move errors: {move_errors}")
-        log(fp, f"Delete errors: {delete_errors}")
         log(fp, f"Elapsed: {elapsed:.2f}s")
 
-    print(f"Done. Report written to: {report_path}")
+    # mark completed
+    try:
+        (out_root / ".RUNNING").unlink(missing_ok=True)
+        (out_root / ".DONE").write_text(f"DONE {datetime.now().isoformat()}\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    print(f"Done. Report: {report_path}")
 
 
 if __name__ == "__main__":
-    # For Windows frozen executables safety (harmless otherwise)
     try:
         import multiprocessing as mp
         mp.freeze_support()
     except Exception:
         pass
-
     main()
